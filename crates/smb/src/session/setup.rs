@@ -45,6 +45,9 @@ where
         new_channel_id: u32,
         primary_session: Option<&Arc<RwLock<SessionAndChannel>>>,
     ) -> crate::Result<Self> {
+        log::debug!("Creating new SessionSetup for user: {:?}, channel_id: {}", identity.username, new_channel_id);
+        log::debug!("Primary session provided: {}", primary_session.is_some());
+        
         let authenticator = Authenticator::build(identity, conn_info)?;
 
         let mut result = Self {
@@ -62,19 +65,26 @@ where
         };
 
         if let Some(primary_session) = primary_session {
+            log::debug!("Setting up session binding with existing primary session");
             let primary_session = primary_session.read().await?;
 
             let session = primary_session.session.clone();
+            log::debug!("Cloned session from primary session");
 
             let channel = primary_session
                 .channel
                 .as_ref()
                 .expect("A properly initialized session is expected in session setup.")
                 .clone();
+            log::debug!("Cloned channel from primary session");
             #[cfg(feature = "ksmbd-multichannel-compat")]
-            let channel = channel.with_binding(true);
+            let channel = {
+                log::debug!("Enabling ksmbd multichannel compatibility");
+                channel.with_binding(true)
+            };
 
             result.set_session(session).await?;
+            log::debug!("Session set for binding setup");
             result
                 .result
                 .as_ref()
@@ -82,8 +92,10 @@ where
                 .write()
                 .await?
                 .channel = Some(channel);
+            log::debug!("Channel assigned to session for binding");
         }
 
+        log::debug!("SessionSetup created successfully");
         Ok(result)
     }
 
@@ -118,24 +130,40 @@ where
     /// This function loops until the authentication is complete, requesting GSS tokens
     /// and passing them to the server.
     async fn _setup_loop(&mut self) -> crate::Result<()> {
+        log::debug!("Starting authentication setup loop");
+        let mut iteration = 0;
+        
         // While there's a response to process, do so.
         while !self.authenticator.is_authenticated()? {
+            iteration += 1;
+            log::debug!("Authentication loop iteration {}", iteration);
             let next_buf = match self.last_setup_response.as_ref() {
-                Some(response) => self.authenticator.next(&response.buffer).await?,
-                None => self.authenticator.next(&[]).await?,
+                Some(response) => {
+                    log::debug!("Processing server response buffer of {} bytes", response.buffer.len());
+                    self.authenticator.next(&response.buffer).await?
+                },
+                None => {
+                    log::debug!("Starting authentication with empty buffer");
+                    self.authenticator.next(&[]).await?
+                },
             };
             let is_auth_done = self.authenticator.is_authenticated()?;
+            log::debug!("Authentication completed after this iteration: {}", is_auth_done);
 
             // If keys are exchanged, set them up, to enable validation of next response!
+            log::debug!("Sending setup request with {} bytes", next_buf.len());
             let request = self.send_setup_request(next_buf).await?;
             if is_auth_done {
+                log::debug!("Authentication completed, finalizing preauth hash and creating channel");
                 self.preauth_hash = self.preauth_hash.take().unwrap().finish().into();
                 self.make_channel().await?;
             }
 
+            log::debug!("Waiting for setup response to message ID: {}", request.msg_id);
             let response = self.receive_setup_response(request.msg_id).await?;
             let message_form = response.form;
             let session_id = response.message.header.session_id;
+            log::debug!("Received response with session ID: {}, message form: {:?}", session_id, message_form);
             let session_setup_response = response.message.content.to_sessionsetup()?;
 
             // First iteration: construct a session state object.
@@ -144,29 +172,36 @@ where
             // which is required for channel construction and signature validation,
             // the first request must arrive here, and then be validated.
             if self.result.is_none() {
-                log::trace!("Creating session state with id {session_id}.");
+                log::debug!("First iteration: creating session state with ID {}", session_id);
                 self.set_session(T::init_session(self, session_id).await?)
                     .await?;
+                log::debug!("Session state created and initialized");
             }
 
             if is_auth_done {
+                log::debug!("Authentication completed, validating message security");
                 // Important: If we did NOT make sure the message's signature is valid,
                 // we should do it now, as long as the session is not anonymous or guest.
-                if !session_setup_response
-                    .session_flags
-                    .is_guest_or_null_session()
-                    && !message_form.signed_or_encrypted()
-                {
+                let is_guest_or_null = session_setup_response.session_flags.is_guest_or_null_session();
+                let is_signed_or_encrypted = message_form.signed_or_encrypted();
+                log::debug!("Session flags - guest/null: {}, message signed/encrypted: {}", is_guest_or_null, is_signed_or_encrypted);
+                
+                if !is_guest_or_null && !is_signed_or_encrypted {
+                    log::error!("Authentication completed but message is not signed for non-guest session");
                     return Err(Error::InvalidMessage(
                         "Expected a signed message!".to_string(),
                     ));
                 }
+                log::debug!("Message security validation passed");
             } else {
+                log::debug!("Authentication not yet complete, updating preauth hash");
                 self.next_preauth_hash(&response.raw);
             }
 
+            log::debug!("Session flags: {:?}", session_setup_response.session_flags);
             self.flags = Some(session_setup_response.session_flags);
-            self.last_setup_response = Some(session_setup_response)
+            self.last_setup_response = Some(session_setup_response);
+            log::debug!("Completed iteration {}, continuing authentication loop", iteration);
         }
 
         self.flags.ok_or(Error::InvalidState(
@@ -181,30 +216,40 @@ where
 
     async fn set_session(&mut self, session: Arc<RwLock<SessionInfo>>) -> crate::Result<()> {
         let session_id = session.read().await?.id();
+        log::debug!("Setting up session with ID: {}", session_id);
         let result = SessionAndChannel::new(session_id, session);
         let session = Arc::new(RwLock::new(result));
+        log::debug!("SessionAndChannel wrapper created");
 
+        log::debug!("Creating channel message handler for setup");
         let setup_handler = ChannelMessageHandler::make_for_setup(&session, self.upstream).await?;
         self.handler = Some(setup_handler);
+        log::debug!("Channel message handler created and assigned");
 
+        log::debug!("Notifying upstream worker of session start");
         self.upstream
             .worker()
             .ok_or_else(|| Error::InvalidState("Worker not available!".to_string()))
             .unwrap()
             .session_started(&session)
             .await?;
+        log::debug!("Upstream worker notified successfully");
 
         self.result = Some(session);
+        log::debug!("Session setup completed and stored in result");
 
         Ok(())
     }
 
     async fn receive_setup_response(&mut self, for_msg_id: u64) -> crate::Result<IncomingMessage> {
         let is_auth_done = self.authenticator.is_authenticated()?;
+        log::debug!("Receiving setup response for message ID: {}, auth_done: {}", for_msg_id, is_auth_done);
 
         let expected_status = if is_auth_done {
+            log::debug!("Expecting Success status");
             &[Status::Success]
         } else {
+            log::debug!("Expecting MoreProcessingRequired status");
             &[Status::MoreProcessingRequired]
         };
 
@@ -222,36 +267,49 @@ where
                 .channel
                 .is_some();
         let skip_security_validation = !is_auth_done && !channel_set_up;
+        log::debug!("Channel setup status: {}, skip security validation: {}", channel_set_up, skip_security_validation);
         if self.handler.is_some() {
-            log::trace!(
-                "setup loop: receiving with channel handler; skip_security_validation={skip_security_validation}"
+            log::debug!(
+                "Receiving with channel handler; skip_security_validation={}", skip_security_validation
             );
-            self.handler
+            let result = self.handler
                 .as_ref()
                 .unwrap()
                 .recvo_internal(roptions, skip_security_validation)
-                .await
+                .await?;
+            log::debug!("Received response via channel handler");
+            Ok(result)
         } else {
             assert!(skip_security_validation);
-            log::trace!("setup loop: receiving with upstream handler");
-            self.upstream.handler.recvo(roptions).await
+            log::debug!("Receiving with upstream handler");
+            let result = self.upstream.handler.recvo(roptions).await?;
+            log::debug!("Received response via upstream handler");
+            Ok(result)
         }
     }
 
     async fn send_setup_request(&mut self, buf: Vec<u8>) -> crate::Result<SendMessageResult> {
+        log::debug!("Preparing setup request with buffer size: {}", buf.len());
         // We'd like to update preauth hash with the last request before accept.
         // therefore we update it here for the PREVIOUS repsponse, assuming that we get an empty request when done.
         let request = T::make_request(self, buf).await?;
+        log::debug!("Setup request created");
 
         let send_result = if let Some(handler) = self.handler.as_ref() {
-            log::trace!("setup loop: sending with channel handler");
-            handler.sendo(request).await?
+            log::debug!("Sending setup request with channel handler");
+            let result = handler.sendo(request).await?;
+            log::debug!("Setup request sent via channel handler, message ID: {}", result.msg_id);
+            result
         } else {
-            log::trace!("setup loop: sending with upstream handler");
-            self.upstream.sendo(request).await?
+            log::debug!("Sending setup request with upstream handler");
+            let result = self.upstream.sendo(request).await?;
+            log::debug!("Setup request sent via upstream handler, message ID: {}", result.msg_id);
+            result
         };
 
+        log::debug!("Updating preauth hash with sent request data");
         self.next_preauth_hash(send_result.raw.as_ref().unwrap());
+        log::debug!("Setup request completed successfully");
         Ok(send_result)
     }
 
@@ -260,22 +318,30 @@ where
     /// - Sets `self.channel` to the instantiated channel.
     /// - Calls `T::on_channel_set_up` after setting up the channel.
     async fn make_channel(&mut self) -> crate::Result<()> {
+        log::debug!("Starting channel creation process");
         T::on_session_key_exchanged(self).await?;
-        log::trace!("Session keys are set.");
+        log::debug!("Session key exchange completed");
 
+        let session_key = self.session_key()?;
+        let preauth_hash = self.preauth_hash_value();
+        log::debug!("Creating channel with ID: {}, has_preauth_hash: {}", self.new_channel_id, preauth_hash.is_some());
+        
         let channel_info = ChannelInfo::new(
             self.new_channel_id,
-            &self.session_key()?,
-            &self.preauth_hash_value(),
+            &session_key,
+            &preauth_hash,
             self.conn_info,
         )?;
+        log::debug!("ChannelInfo created successfully");
 
         self.channel = Some(channel_info);
+        log::debug!("Channel stored in setup state");
 
         let mut session_lock = self.result.as_ref().unwrap().write().await?;
         session_lock.set_channel(self.channel.take().unwrap());
+        log::debug!("Channel assigned to session");
 
-        log::trace!("Channel for current setup has been initialized");
+        log::debug!("Channel creation and assignment completed successfully");
         Ok(())
     }
 
@@ -367,6 +433,7 @@ impl SessionSetupProperties for SmbSessionBind {
     where
         T: SessionSetupProperties,
     {
+        log::debug!("SmbSessionBind: Creating binding request with {} bytes", buffer.len());
         let mut request = Self::_make_default_request(buffer);
         request
             .message
@@ -375,6 +442,7 @@ impl SessionSetupProperties for SmbSessionBind {
             .unwrap()
             .flags
             .set_binding(true);
+        log::debug!("SmbSessionBind: Binding flag set on request");
         Ok(request)
     }
 
@@ -382,16 +450,20 @@ impl SessionSetupProperties for SmbSessionBind {
     where
         T: SessionSetupProperties,
     {
+        log::debug!("SmbSessionBind: Starting error cleanup");
         if setup.result.is_none() {
-            log::warn!("No session to cleanup in binding.");
+            log::warn!("SmbSessionBind: No session to cleanup in binding");
             return Ok(());
         }
+        log::debug!("SmbSessionBind: Notifying worker of session end");
         setup
             .upstream
             .worker()
             .ok_or_else(|| Error::InvalidState("Worker not available!".to_string()))?
             .session_ended(setup.result.as_ref().unwrap())
-            .await
+            .await?;
+        log::debug!("SmbSessionBind: Error cleanup completed");
+        Ok(())
     }
 
     async fn init_session<T>(
@@ -408,6 +480,7 @@ impl SessionSetupProperties for SmbSessionBind {
     where
         T: SessionSetupProperties,
     {
+        log::debug!("SmbSessionBind: Session binding completed successfully");
         Ok(())
     }
 }
@@ -420,24 +493,29 @@ impl SessionSetupProperties for SmbSessionNew {
     where
         T: SessionSetupProperties,
     {
+        log::debug!("SmbSessionNew: Starting error cleanup for new session");
         if setup.result.is_none() {
-            log::trace!("No session to cleanup in setup.");
+            log::debug!("SmbSessionNew: No session to cleanup in setup");
             return Ok(());
         }
 
-        log::trace!("Invalidating session before cleanup.");
+        log::debug!("SmbSessionNew: Invalidating session before cleanup");
         let session = setup.result.as_ref().unwrap();
         {
             let session_lock = session.read().await?;
             session_lock.session.write().await?.invalidate();
         }
+        log::debug!("SmbSessionNew: Session invalidated");
 
+        log::debug!("SmbSessionNew: Notifying worker of session end");
         setup
             .upstream
             .worker()
             .ok_or_else(|| Error::InvalidState("Worker not available!".to_string()))?
             .session_ended(setup.result.as_ref().unwrap())
-            .await
+            .await?;
+        log::debug!("SmbSessionNew: Error cleanup completed");
+        Ok(())
     }
 
     async fn on_session_key_exchanged<T>(setup: &mut SessionSetup<'_, T>) -> crate::Result<()>
@@ -445,7 +523,7 @@ impl SessionSetupProperties for SmbSessionNew {
         T: SessionSetupProperties,
     {
         // Only on new sessions we need to initialize the session state with the keys.
-        log::trace!("Session keys exchanged. Setting up session state.");
+        log::debug!("SmbSessionNew: Session keys exchanged, setting up session state");
         setup
             .result
             .as_ref()
@@ -459,17 +537,23 @@ impl SessionSetupProperties for SmbSessionNew {
                 &setup.session_key()?,
                 &setup.preauth_hash_value(),
                 setup.conn_info,
-            )
+            )?;
+        log::debug!("SmbSessionNew: Session state setup completed with keys");
+        Ok(())
     }
 
     async fn on_setup_success<T>(setup: &mut SessionSetup<'_, T>) -> crate::Result<()>
     where
         T: SessionSetupProperties,
     {
-        log::trace!("Session setup successful");
+        log::debug!("SmbSessionNew: Session setup successful, marking session as ready");
         let result = setup.result.as_ref().unwrap().read().await?;
         let mut session = result.session.write().await?;
-        session.ready(setup.flags.unwrap(), setup.conn_info)
+        let flags = setup.flags.unwrap();
+        log::debug!("SmbSessionNew: Setting session ready with flags: {:?}", flags);
+        session.ready(flags, setup.conn_info)?;
+        log::debug!("SmbSessionNew: Session marked as ready successfully");
+        Ok(())
     }
 
     async fn init_session<T>(
@@ -479,8 +563,10 @@ impl SessionSetupProperties for SmbSessionNew {
     where
         T: SessionSetupProperties,
     {
+        log::debug!("SmbSessionNew: Initializing new session with ID: {}", session_id);
         let session_info = SessionInfo::new(session_id);
         let session_info = Arc::new(RwLock::new(session_info));
+        log::debug!("SmbSessionNew: New session info created and wrapped");
 
         Ok(session_info)
     }
