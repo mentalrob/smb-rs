@@ -1,3 +1,4 @@
+use std::net::SocketAddr;
 use std::sync::Arc;
 
 use crate::Error;
@@ -19,6 +20,8 @@ pub struct Authenticator {
     ssp: Negotiate,
     cred_handle: AcquireCredentialsHandleResult<Option<CredentialsBuffers>>,
     current_state: Option<InitializeSecurityContextResult>,
+
+    server_address: SocketAddr,
 }
 
 impl Authenticator {
@@ -26,8 +29,7 @@ impl Authenticator {
         identity: AuthIdentity,
         conn_info: &Arc<ConnectionInfo>,
     ) -> crate::Result<Authenticator> {
-        log::debug!("Building authenticator for user: {:?}, server: {}", identity.username, conn_info.server_name);
-        
+        log::debug!("Building authenticator for user: {:?}, server: {}, {:?}", identity.username, conn_info.server_name, conn_info.server_address);
         let client_computer_name = conn_info
             .config
             .client_name
@@ -61,6 +63,7 @@ impl Authenticator {
             cred_handle,
             current_state: None,
             user_name,
+            server_address: conn_info.server_address,
         })
     }
 
@@ -162,13 +165,27 @@ impl Authenticator {
                 log::debug!("Resolving with Kerberos network client");
                 #[cfg(feature = "async")]
                 {
-                    generator
-                        .resolve_with_async_client(&mut ReqwestNetworkClient::new())
-                        .await?
+                    use std::net::IpAddr;
+
+                    let server_address = self.server_address.ip();
+                    if let IpAddr::V4(server_address) = server_address {
+                        generator
+                            .resolve_with_async_client(&mut ReqwestNetworkClient::new(server_address))
+                            .await?
+                    } else {
+                        return Err(Error::InvalidState("Server address is not an IPv4 address.".into()));
+                    }
                 }
                 #[cfg(not(feature = "async"))]
                 {
-                    generator.resolve_with_client(&ReqwestNetworkClient {})?
+                    use std::net::IpAddr;
+
+                    let server_address = self.server_address.ip();
+                    if let IpAddr::V4(server_address) = server_address {
+                        generator.resolve_with_client(&ReqwestNetworkClient::new(server_address))?;
+                    } else {
+                        return Err(Error::InvalidState("Server address is not an IPv4 address.".into()));
+                    }
                 }
             }
             #[cfg(not(feature = "kerberos"))]

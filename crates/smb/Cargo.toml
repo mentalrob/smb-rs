@@ -69,7 +69,7 @@ temp-env = { version = "0.3.6", features = ["async_closure"] }
 tokio = { workspace = true, features = ["rt", "macros"] }
 
 [features]
-default = ["sign", "encrypt", "compress", "async", "std-fs-impls", "netbios-transport"]
+default = ["sign", "encrypt", "compress", "async", "std-fs-impls", "netbios-transport", "kerberos"]
 
 # Threading models
 async = [

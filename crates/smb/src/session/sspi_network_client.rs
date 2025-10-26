@@ -46,7 +46,7 @@ mod client_impl {
     use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
     use tokio::net::{TcpStream, UdpSocket};
 
-    pub struct ReqwestNetworkClient;
+    pub struct ReqwestNetworkClient(Ipv4Addr);
 
     impl AsyncNetworkClient for ReqwestNetworkClient {
         fn send<'a>(
@@ -58,14 +58,8 @@ mod client_impl {
     }
 
     impl ReqwestNetworkClient {
-        pub fn new() -> Self {
-            Self {}
-        }
-    }
-
-    impl Default for ReqwestNetworkClient {
-        fn default() -> Self {
-            Self::new()
+        pub fn new(server_address: Ipv4Addr) -> Self {
+            Self(server_address)
         }
     }
 
@@ -84,7 +78,7 @@ mod client_impl {
         async fn send_tcp(&self, url: &Url, data: &[u8]) -> sspi::Result<Vec<u8>> {
             let addr = format!(
                 "{}:{}",
-                url.host_str().unwrap_or_default(),
+                self.0.to_string(),
                 url.port().unwrap_or(88)
             );
             let mut stream = TcpStream::connect(addr).await.map_err(|e| {
@@ -118,7 +112,7 @@ mod client_impl {
 
             let addr = format!(
                 "{}:{}",
-                url.host_str().unwrap_or_default(),
+                self.0.to_string(),
                 url.port().unwrap_or(88)
             );
 
@@ -191,13 +185,16 @@ mod client_impl {
     use std::net::{IpAddr, Ipv4Addr, TcpStream, UdpSocket};
 
     #[derive(Clone, Default)]
-    pub struct ReqwestNetworkClient;
+    pub struct ReqwestNetworkClient(Ipv4Addr);
 
     impl ReqwestNetworkClient {
+        pub fn new(server_address: Ipv4Addr) -> Self {
+            Self(server_address)
+        }
         fn send_tcp(&self, url: &Url, data: &[u8]) -> Result<Vec<u8>> {
             let addr = format!(
                 "{}:{}",
-                url.host_str().unwrap_or_default(),
+                self.0.to_string(),
                 url.port().unwrap_or(88)
             );
             let mut stream = TcpStream::connect(addr).map_err(|e| {
@@ -227,7 +224,7 @@ mod client_impl {
 
             let addr = format!(
                 "{}:{}",
-                url.host_str().unwrap_or_default(),
+                self.0.to_string(),
                 url.port().unwrap_or(88)
             );
             udp_socket.send_to(data, addr)?;
